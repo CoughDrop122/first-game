@@ -66,6 +66,30 @@ function GameConfig.GetInitialOwner(trenchIndex: number): Owner
 	return "Neutral"
 end
 
+-- Units ------------------------------------------------------------------
+
+export type Team = "Allies" | "Enemies"
+
+GameConfig.UNIT_WALK_SPEED = 8 -- studs per second
+GameConfig.DEPLOY_COOLDOWN = 0.5 -- seconds between deploys, per player
+GameConfig.ENEMY_SPAWN_INTERVAL = 4 -- seconds between enemy garrison spawns
+GameConfig.ENEMY_MAX_UNITS = 6 -- enemy garrison size (no enemy AI yet)
+
+-- Names of the RemoteEvents the server creates in ReplicatedStorage.Remotes.
+GameConfig.REMOTES_FOLDER = "Remotes"
+GameConfig.REMOTE_DEPLOY_UNIT = "DeployUnit"
+GameConfig.REMOTE_ADVANCE_TRENCH = "AdvanceTrench"
+
+-- The trench nearest a team's spawn zone, where its units deploy to.
+function GameConfig.GetHomeTrenchIndex(team: Team): number
+	return if team == "Allies" then 1 else GameConfig.TRENCH_COUNT
+end
+
+-- Trench-index step a team takes when advancing toward the other side.
+function GameConfig.GetAdvanceDirection(team: Team): number
+	return if team == "Allies" then 1 else -1
+end
+
 -- World X of the centre of a team's spawn zone.
 function GameConfig.GetSpawnZoneCenterX(owner: "Allies" | "Enemies"): number
 	local x = (GameConfig.MAP_SIZE_X - GameConfig.SPAWN_ZONE_WIDTH) / 2
