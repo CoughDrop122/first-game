@@ -14,4 +14,24 @@ Next, open `first-game.rbxlx` in Roblox Studio and start the Rojo server:
 rojo serve
 ```
 
+## Two places
+
+The experience is two Roblox places built from this repo:
+
+| Place | Project file | Code |
+|---|---|---|
+| Battle (Trench Warfare) | `default.project.json` | `src/server`, `src/client` |
+| Lobby (start place) | `lobby.project.json` | `src/lobby/server`, `src/lobby/client` |
+
+Both share `src/shared`. The commands above use the battle place; for the lobby:
+
+```bash
+rojo build lobby.project.json -o "first-game-lobby.rbxlx"
+rojo serve lobby.project.json
+```
+
+The lobby teleports players to the Place ID set for each mode in
+`src/shared/GameModes.luau`. Until that is filled in (it is `0`), the lobby
+lists the mode but won't teleport.
+
 For more help, check out [the Rojo documentation](https://rojo.space/docs).
