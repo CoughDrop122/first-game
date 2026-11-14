@@ -128,7 +128,7 @@ local function buildSpawnZone(owner: "Allies" | "Enemies", color: Color3, parent
 		Position = Vector3.new(GameConfig.GetSpawnZoneCenterX(owner), GameConfig.GROUND_Y + 0.1, 0),
 		Color = color,
 		Material = Enum.Material.SmoothPlastic,
-		Transparency = 0.6,
+		Transparency = 1, -- invisible; kept as a marker of the zone's bounds
 		CanCollide = false,
 	}, parent)
 	zone:SetAttribute("Owner", owner)

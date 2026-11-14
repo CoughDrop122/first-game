@@ -89,6 +89,14 @@ GameConfig.STARTING_COMMAND_TIER = 1 -- nothing raises this yet; here for Comman
 -- Folder in ReplicatedStorage whose attributes hold each team's state.
 GameConfig.TEAM_STATE_FOLDER = "TeamState"
 
+-- Match flow. A team wins by taking the other team's home trench. The match
+-- state is replicated as attributes on the TeamState folder:
+--   MatchPhase : MATCH_PHASE_PLAYING or MATCH_PHASE_ENDED
+--   Winner     : "Allies" / "Enemies" once ended, "" while playing
+GameConfig.MATCH_PHASE_PLAYING = "Playing"
+GameConfig.MATCH_PHASE_ENDED = "Ended"
+GameConfig.RESTART_COOLDOWN = 3 -- seconds after a match ends before Play Again is accepted
+
 -- Combat rules shared by every unit ----------------------------------------
 
 -- Hit-chance multiplier against a target settled in a trench, unless the
@@ -210,18 +218,93 @@ local Units: { [string]: UnitDefinition } = {
 		Unlock = { Type = "TrenchesOwned", Count = 2 },
 	},
 
+	-- Fast, inaccurate fire: strongest against troops crossing open ground.
+	MachineGunner = {
+		DisplayName = "Machine Gunner",
+		SortOrder = 3,
+		Cost = 150,
+		MaxHP = 110,
+		MoveSpeed = 6.5, -- heavy weapon
+		Range = 46,
+		FireRate = 6,
+		Damage = 10,
+		Accuracy = 0.4,
+		ArmorType = "Infantry",
+		IgnoresCover = false,
+		SplashRadius = 0,
+		OccupiesTrenchSlot = true,
+		Visual = {
+			BodyScale = 1.05,
+			Hat = "Helmet",
+			HatColor = Color3.fromRGB(60, 62, 58),
+			WeaponSize = Vector3.new(0.45, 0.45, 3.2),
+			WeaponColor = Color3.fromRGB(30, 30, 32),
+			AccentColor = Color3.fromRGB(120, 124, 128),
+		},
+		Unlock = { Type = "TrenchesOwned", Count = 2 },
+	},
+
+	-- Slow, precise shots that ignore trench cover. Range exceeds TRENCH_SPACING,
+	-- so a sniper can pick at the neighbouring trench without leaving its own.
+	Sniper = {
+		DisplayName = "Sniper",
+		SortOrder = 4,
+		Cost = 160,
+		MaxHP = 70,
+		MoveSpeed = 8,
+		Range = 70,
+		FireRate = 0.25,
+		Damage = 80,
+		Accuracy = 0.75,
+		ArmorType = "Infantry",
+		IgnoresCover = true,
+		SplashRadius = 0,
+		OccupiesTrenchSlot = true,
+		Visual = {
+			BodyScale = 0.95,
+			Hat = "None",
+			HatColor = Color3.fromRGB(0, 0, 0),
+			WeaponSize = Vector3.new(0.2, 0.2, 3.6),
+			WeaponColor = Color3.fromRGB(70, 52, 34),
+			AccentColor = Color3.fromRGB(70, 110, 60),
+		},
+		Unlock = { Type = "TrenchesOwned", Count = 3 },
+	},
+
+	-- Short-ranged grenades that ignore cover and also hurt enemies next to the
+	-- target (SplashRadius reaches the neighbouring slot on each side). Has to
+	-- get close, so it works best alongside a charge.
+	Grenadier = {
+		DisplayName = "Grenadier",
+		SortOrder = 5,
+		Cost = 110,
+		MaxHP = 100,
+		MoveSpeed = 8,
+		Range = 26,
+		FireRate = 0.4,
+		Damage = 35,
+		Accuracy = 0.6,
+		ArmorType = "Infantry",
+		IgnoresCover = true,
+		SplashRadius = 5,
+		OccupiesTrenchSlot = true,
+		Visual = {
+			BodyScale = 1,
+			Hat = "Helmet",
+			HatColor = Color3.fromRGB(88, 96, 72),
+			WeaponSize = Vector3.new(0.5, 0.5, 1.2),
+			WeaponColor = Color3.fromRGB(50, 60, 40),
+			AccentColor = Color3.fromRGB(215, 120, 40),
+		},
+		Unlock = { Type = "TrenchesOwned", Count = 3 },
+	},
+
 	-- Future units: add an entry like the sketches below. Fields shown are the
 	-- ones that differ from a Rifleman; every field in UnitDefinition is required.
 	--
-	-- MachineGunner = { Cost = 150, MaxHP = 110, Range = 44, FireRate = 5, Damage = 9, Accuracy = 0.35,
-	--     Unlock = { Type = "TrenchesOwned", Count = 2 }, ... },
-	-- Sniper        = { Cost = 140, MaxHP = 70, Range = 70, FireRate = 0.3, Damage = 90, Accuracy = 0.9,
+	-- Mortar = { Cost = 220, Range = 110, FireRate = 0.2, Damage = 55, SplashRadius = 8,
 	--     IgnoresCover = true, Unlock = { Type = "CommandTier", Tier = 2 }, ... },
-	-- Grenadier     = { Cost = 110, Range = 26, FireRate = 0.4, Damage = 40, SplashRadius = 5,
-	--     IgnoresCover = true, Unlock = { Type = "TrenchesOwned", Count = 3 }, ... },
-	-- Mortar        = { Cost = 220, Range = 110, FireRate = 0.2, Damage = 55, SplashRadius = 8,
-	--     IgnoresCover = true, Unlock = { Type = "CommandTier", Tier = 2 }, ... },
-	-- Tank          = { Cost = 500, MaxHP = 900, MoveSpeed = 5, ArmorType = "Vehicle",
+	-- Tank   = { Cost = 500, MaxHP = 900, MoveSpeed = 5, ArmorType = "Vehicle",
 	--     OccupiesTrenchSlot = false, Unlock = { Type = "CommandTier", Tier = 3 }, ... },
 	--   (give anti-tank weapons DamageVsArmor = { Vehicle = 3 } and small arms { Vehicle = 0.1 })
 	--
@@ -272,12 +355,15 @@ end
 --
 -- Ordered from a trench with a settled unit that has CanOrderCharge. Everyone
 -- in the trench advances; for Duration seconds they move faster and do not
--- halt to shoot while enemies are in range.
+-- halt to shoot while crossing open ground. They still won't run into a trench
+-- the enemy occupies: they stop HaltDistance short of it and fight until it is
+-- clear, as in a regular assault.
 GameConfig.Charge = {
 	DisplayName = "Charge",
 	Cost = 30, -- supplies
 	Duration = 8, -- seconds
 	SpeedMultiplier = 1.15,
+	HaltDistance = 8, -- studs from an enemy-occupied trench at which chargers stop
 	Cooldown = 20, -- seconds, per trench
 }
 
@@ -355,6 +441,7 @@ GameConfig.REMOTE_ADVANCE_TRENCH = "AdvanceTrench" -- (trenchIndex: number)
 GameConfig.REMOTE_RETREAT_TRENCH = "RetreatTrench" -- (trenchIndex: number)
 GameConfig.REMOTE_TRIGGER_CHARGE = "TriggerCharge" -- (trenchIndex: number)
 GameConfig.REMOTE_BUILD_FORTIFICATION = "BuildFortification" -- (trenchIndex: number, fortificationType: string)
+GameConfig.REMOTE_RESTART_MATCH = "RestartMatch" -- (); only accepted once the match has ended
 -- UnreliableRemoteEvent, server -> clients. Carries a flat array of Vector3s,
 -- two per shot (muzzle, impact), for clients to draw tracers from.
 GameConfig.REMOTE_SHOTS_FIRED = "ShotsFired"

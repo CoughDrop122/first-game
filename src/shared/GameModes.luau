@@ -29,6 +29,14 @@ local Modes: { [string]: GameMode } = {
 }
 GameModes.Modes = Modes
 
+-- Place ID of the published lobby place (lobby.project.json), for the battle
+-- place's Return to Lobby button. 0 = not published yet.
+GameModes.LOBBY_PLACE_ID = 0 -- TODO: Place ID of the published lobby place
+
+-- RemoteFunction a battle place's server creates in ReplicatedStorage.
+-- Client invokes with no arguments; server returns (accepted: boolean, message: string).
+GameModes.REMOTE_RETURN_TO_LOBBY = "ReturnToLobby"
+
 -- RemoteFunction the lobby server creates in ReplicatedStorage.
 -- Client invokes with (modeId: string); server returns (accepted: boolean, message: string).
 GameModes.REMOTE_REQUEST_MODE = "RequestGameMode"

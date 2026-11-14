@@ -9,6 +9,7 @@
 --   AlliesIncome   / EnemiesIncome   : supplies gained per second
 --   AlliesTrenchesOwned / EnemiesTrenchesOwned, AlliesCommandTier /
 --   EnemiesCommandTier : inputs to GameConfig.IsUnitUnlocked
+--   MatchPhase / Winner : match flow (see GameConfig.MATCH_PHASE_*)
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -30,6 +31,9 @@ local supplies: { [Team]: number } = {
 
 local teamState = Instance.new("Folder")
 teamState.Name = GameConfig.TEAM_STATE_FOLDER
+
+-- Winner of the current match, or nil while it is still being played.
+local winner: Team? = nil
 
 local trenchesFolder = Workspace:WaitForChild("Trenches")
 
@@ -87,16 +91,48 @@ function Economy.TrySpend(team: Team, cost: number): boolean
 	return true
 end
 
+local function replicateMatch()
+	teamState:SetAttribute(
+		"MatchPhase",
+		if winner then GameConfig.MATCH_PHASE_ENDED else GameConfig.MATCH_PHASE_PLAYING
+	)
+	teamState:SetAttribute("Winner", winner or "")
+end
+
+function Economy.GetWinner(): Team?
+	return winner
+end
+
+-- Ends the match in favour of `team`. Income stops until Economy.Reset.
+function Economy.SetWinner(team: Team)
+	winner = team
+	replicateMatch()
+end
+
+-- Starts a fresh match: starting Supplies for both teams and no winner. Call
+-- after trench ownership has been reset so income is replicated correctly.
+function Economy.Reset()
+	winner = nil
+	for _, team in TEAMS do
+		supplies[team] = GameConfig.STARTING_SUPPLIES
+		replicate(team)
+	end
+	replicateMatch()
+end
+
 for _, team in TEAMS do
 	replicate(team)
 end
+replicateMatch()
 teamState.Parent = ReplicatedStorage
 
 task.spawn(function()
 	while true do
 		task.wait(INCOME_TICK)
-		for _, team in TEAMS do
-			Economy.Add(team, Economy.GetIncome(team) * INCOME_TICK)
+		if not winner then
+			for _, team in TEAMS do
+				Economy.Add(team, Economy.GetIncome(team) * INCOME_TICK)
+			end
 		end
 	end
 end)

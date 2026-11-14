@@ -3,6 +3,8 @@
 -- types defined in GameConfig.Units, tracks which trench slot each one holds,
 -- marches them between slots, resolves combat, and runs officer abilities
 -- (aura, charge, fortification building). Everything costs Supplies (Economy).
+-- A team wins by taking the other's home trench; the simulation then freezes
+-- until a player restarts the match.
 --
 -- Trench Models carry replicated attributes the client UI reads:
 --   AlliesCount / EnemiesCount       : units tied to the trench
@@ -131,6 +133,7 @@ local advanceRemote = makeRemoteEvent(GameConfig.REMOTE_ADVANCE_TRENCH)
 local retreatRemote = makeRemoteEvent(GameConfig.REMOTE_RETREAT_TRENCH)
 local chargeRemote = makeRemoteEvent(GameConfig.REMOTE_TRIGGER_CHARGE)
 local buildRemote = makeRemoteEvent(GameConfig.REMOTE_BUILD_FORTIFICATION)
+local restartRemote = makeRemoteEvent(GameConfig.REMOTE_RESTART_MATCH)
 
 -- Tracers are cosmetic, so a dropped packet is fine.
 local shotsRemote = Instance.new("UnreliableRemoteEvent")
@@ -152,6 +155,10 @@ for trenchIndex = 1, GameConfig.TRENCH_COUNT do
 end
 
 local fortifications: { Fortification } = {}
+
+-- True once a team has won. The simulation and all orders stop until resetMatch.
+local matchOver = false
+local matchEndedAt = 0 -- os.clock() when the match ended
 
 -- Units of a team tied to a trench: holding a slot, marching to one, or
 -- waiting outside it.
@@ -184,6 +191,16 @@ local function hasSettledAbility(
 	for _, unit in slots[trenchIndex] do
 		local abilities = unit.def.Abilities
 		if unit.team == team and unit.arrived and abilities and abilities[ability] then
+			return true
+		end
+	end
+	return false
+end
+
+-- Whether any unit of the other team holds, or is heading for, a slot in the trench.
+local function isOccupiedByEnemy(trenchIndex: number, team: Team): boolean
+	for _, unit in slots[trenchIndex] do
+		if unit.team ~= team then
 			return true
 		end
 	end
@@ -274,6 +291,13 @@ local function updateOwner(trenchIndex: number)
 		if fort.trenchIndex == trenchIndex and fort.team ~= holder then
 			destroyFortification(fort)
 		end
+	end
+
+	-- Taking the other team's home trench wins the match.
+	if not matchOver and trenchIndex == GameConfig.GetHomeTrenchIndex(getOtherTeam(holder)) then
+		matchOver = true
+		matchEndedAt = os.clock()
+		Economy.SetWinner(holder)
 	end
 end
 
@@ -441,6 +465,9 @@ end
 -- home trench. Returns nil, charging nothing, if the unit type doesn't exist or
 -- is locked, the home trench has no free slot, or the team can't afford it.
 local function spawnUnit(team: Team, unitType: string): Unit?
+	if matchOver then
+		return nil
+	end
 	local def = GameConfig.Units[unitType]
 	if not def or not GameConfig.IsUnitUnlocked(unitType, Economy.GetTeamState(team)) then
 		return nil
@@ -948,6 +975,9 @@ local function applyHazards(unit: Unit, deltaTime: number): number
 end
 
 RunService.Heartbeat:Connect(function(deltaTime: number)
+	if matchOver then
+		return
+	end
 	bucketsStale = true
 	updateFortifications(deltaTime)
 	updateCombat(deltaTime)
@@ -974,8 +1004,16 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 		end
 
 		-- Hold position and fight while any enemy is in range; move on once the
-		-- way is clear. Retreating and charging units keep moving under fire.
-		if unit.target and not unit.retreating and not charging then
+		-- way is clear. Retreating units keep moving under fire. Charging units
+		-- keep running across open ground, but stop short of their destination
+		-- trench while the enemy still occupies it.
+		local holding = unit.target ~= nil and not unit.retreating
+		if holding and charging then
+			local distanceToTrench = math.abs(unit.position.X - GameConfig.GetTrenchCenterX(unit.trenchIndex))
+			holding = distanceToTrench <= GameConfig.Charge.HaltDistance
+				and isOccupiedByEnemy(unit.trenchIndex, unit.team)
+		end
+		if holding then
 			continue
 		end
 		if charging then
@@ -1068,6 +1106,9 @@ end)
 -- Validates a client-supplied trench index and applies the per-player order
 -- rate limit. Returns the index if the order may go ahead.
 local function acceptTrenchOrder(player: Player, trenchIndex: unknown): number?
+	if matchOver then
+		return nil
+	end
 	if typeof(trenchIndex) ~= "number" or trenchIndex % 1 ~= 0 or not isValidTrenchIndex(trenchIndex) then
 		return nil
 	end
@@ -1115,6 +1156,50 @@ Players.PlayerRemoving:Connect(function(player: Player)
 	lastOrderTime[player] = nil
 end)
 
+-- Match flow ---------------------------------------------------------------------
+
+-- Clears the battlefield and starts a fresh match.
+local function resetMatch()
+	for _, unit in units do
+		unit.dead = true
+		unit.model:Destroy()
+	end
+	units = {}
+	for trenchIndex = 1, GameConfig.TRENCH_COUNT do
+		table.clear(slots[trenchIndex])
+	end
+
+	for _, fort in fortifications do
+		fort.destroyed = true
+		fort.model:Destroy()
+	end
+	fortifications = {}
+
+	table.clear(pendingShots)
+	bucketsStale = true
+
+	for trenchIndex = 1, GameConfig.TRENCH_COUNT do
+		local trench = trenchModels[trenchIndex]
+		trench:SetAttribute("Owner", GameConfig.GetInitialOwner(trenchIndex))
+		for _, team in TEAMS do
+			chargeReadyAt[team][trenchIndex] = nil
+			trench:SetAttribute(`{team}ChargeReadyAt`, 0)
+		end
+		refreshTrench(trenchIndex)
+		refreshFortificationAttributes(trenchIndex)
+	end
+
+	Economy.Reset()
+	matchOver = false
+end
+
+-- Any player may restart once the match has ended.
+restartRemote.OnServerEvent:Connect(function(_player: Player)
+	if matchOver and os.clock() - matchEndedAt >= GameConfig.RESTART_COOLDOWN then
+		resetMatch()
+	end
+end)
+
 -- NPC Enemy commander testing stage -------------------------------------------------------------
 
 for trenchIndex = 1, GameConfig.TRENCH_COUNT do
@@ -1128,6 +1213,10 @@ task.spawn(function()
 	local sinceAdvance = 0
 	while true do
 		task.wait(GameConfig.ENEMY_SPAWN_INTERVAL)
+		if matchOver then
+			sinceAdvance = 0
+			continue
+		end
 		if countTeam("Enemies") < GameConfig.ENEMY_MAX_UNITS then
 			spawnUnit("Enemies", GameConfig.ENEMY_UNIT_TYPE)
 		end
