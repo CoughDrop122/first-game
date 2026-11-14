@@ -1,11 +1,12 @@
 --!strict
 -- Command bar. Everything is driven by GameConfig (unit and fortification
--- registries) and by state the server replicates as attributes on the trench
--- Models and on ReplicatedStorage.TeamState.
+-- registries), by Shared.MapLoader (which trenches exist and how they link),
+-- and by state the server replicates as attributes on the trench Models and on
+-- ReplicatedStorage.TeamState.
 --
 -- Layout:
 --   Deploy row  : [ Supplies ] [ one button per unit type in GameConfig.Units ]
---   Trench row  : [ Trench 1 ] ... [ Trench N ]         <- pick a trench
+--   Trench row  : [ one button per trench on the map ]   <- pick a trench
 --   Orders row  : [ Retreat ] [ Advance ] [ Charge ] [ one Build button per fortification ]
 --                 (orders apply to the selected trench)
 
@@ -14,9 +15,12 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
-local GameConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("GameConfig"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local GameConfig = require(Shared:WaitForChild("GameConfig"))
+local MapLoader = require(Shared:WaitForChild("MapLoader"))
 
 local TEAM: GameConfig.Team = "Allies"
+local OTHER_TEAM: GameConfig.Team = "Enemies"
 local DEPLOY_ACTION = "DeployUnit"
 local CELL_PADDING = 0.01 -- gap between buttons, as a fraction of the row width
 local MAX_CELL_WIDTH = 0.19
@@ -33,20 +37,15 @@ local retreatRemote = remotes:WaitForChild(GameConfig.REMOTE_RETREAT_TRENCH) :: 
 local chargeRemote = remotes:WaitForChild(GameConfig.REMOTE_TRIGGER_CHARGE) :: RemoteEvent
 local buildRemote = remotes:WaitForChild(GameConfig.REMOTE_BUILD_FORTIFICATION) :: RemoteEvent
 
-local trenchesFolder = Workspace:WaitForChild("Trenches")
-local trenchModels: { Instance } = {}
-for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-	trenchModels[trenchIndex] = trenchesFolder:WaitForChild(`Trench_{trenchIndex}`)
-end
-
 local teamState = ReplicatedStorage:WaitForChild(GameConfig.TEAM_STATE_FOLDER)
+
+MapLoader.WaitUntilReady()
 
 local unitTypes = GameConfig.GetSortedKeys(GameConfig.Units)
 local fortTypes = GameConfig.GetSortedKeys(GameConfig.Fortifications)
-local homeTrench = GameConfig.GetHomeTrenchIndex(TEAM)
-local advanceDirection = GameConfig.GetAdvanceDirection(TEAM)
 
-local selectedTrench = homeTrench
+-- Id of the trench the orders row applies to, or nil if the map has none.
+local selectedTrench: number? = MapLoader.GetHomeTrenchId(TEAM)
 
 -- Replicated state ------------------------------------------------------------
 
@@ -55,17 +54,15 @@ local function getTeamNumber(attribute: string): number
 	return if typeof(value) == "number" then value else 0
 end
 
-local function getTrenchNumber(trenchIndex: number, attribute: string): number
-	local value = trenchModels[trenchIndex]:GetAttribute(attribute)
+local function getTrenchNumber(trenchId: number, attribute: string): number
+	local trench = MapLoader.GetTrenchModel(trenchId)
+	local value = trench and trench:GetAttribute(attribute)
 	return if typeof(value) == "number" then value else 0
 end
 
-local function getTrenchFlag(trenchIndex: number, attribute: string): boolean
-	return trenchModels[trenchIndex]:GetAttribute(attribute) == true
-end
-
-local function isValidTrenchIndex(trenchIndex: number): boolean
-	return trenchIndex >= 1 and trenchIndex <= GameConfig.TRENCH_COUNT
+local function getTrenchFlag(trenchId: number, attribute: string): boolean
+	local trench = MapLoader.GetTrenchModel(trenchId)
+	return trench ~= nil and trench:GetAttribute(attribute) == true
 end
 
 -- UI --------------------------------------------------------------------------
@@ -101,7 +98,8 @@ end
 
 -- Size for each of `cellCount` equal cells sharing a row.
 local function getCellSize(cellCount: number): UDim2
-	local width = (1 - CELL_PADDING * (cellCount - 1)) / cellCount
+	local count = math.max(cellCount, 1)
+	local width = (1 - CELL_PADDING * (count - 1)) / count
 	return UDim2.fromScale(math.min(width, MAX_CELL_WIDTH), 1)
 end
 
@@ -140,24 +138,22 @@ for order, unitType in unitTypes do
 	deployButtons[unitType] = makeButton(`Deploy_{unitType}`, order, deployCellSize, deployRow)
 end
 
--- Trench row
-local trenchCellSize = getCellSize(GameConfig.TRENCH_COUNT)
-local trenchButtons: { TextButton } = {}
-for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-	trenchButtons[trenchIndex] = makeButton(`Trench_{trenchIndex}`, trenchIndex, trenchCellSize, trenchRow)
-end
-local unselectedColor = trenchButtons[1].BackgroundColor3
-
 -- Orders row
 local ordersCellSize = getCellSize(3 + #fortTypes)
 local retreatButton = makeButton("RetreatButton", 1, ordersCellSize, ordersRow)
 local advanceButton = makeButton("AdvanceButton", 2, ordersCellSize, ordersRow)
 local chargeButton = makeButton("ChargeButton", 3, ordersCellSize, ordersRow)
+local unselectedColor = retreatButton.BackgroundColor3
 
 local buildButtons: { [string]: TextButton } = {}
 for order, fortType in fortTypes do
 	buildButtons[fortType] = makeButton(`Build_{fortType}`, 3 + order, ordersCellSize, ordersRow)
 end
+
+-- Trench row: one button per trench on the map, rebuilt whenever the map
+-- changes (see rebuildTrenchRow).
+local trenchButtons: { [number]: TextButton } = {}
+local trenchConnections: { RBXScriptConnection } = {}
 
 -- Refresh -----------------------------------------------------------------------
 
@@ -168,16 +164,22 @@ local function refreshDeployRow(supplies: number)
 		TrenchesOwned = getTeamNumber("TrenchesOwned"),
 		CommandTier = getTeamNumber("CommandTier"),
 	}
-	local homeCount = getTrenchNumber(homeTrench, "AlliesCount") + getTrenchNumber(homeTrench, "EnemiesCount")
-	local homeFull = homeCount >= GameConfig.SLOTS_PER_TRENCH
+	local homeTrench = MapLoader.GetHomeTrenchId(TEAM)
+	local homeFull = true
+	if homeTrench then
+		local homeCount = getTrenchNumber(homeTrench, `{TEAM}Count`) + getTrenchNumber(homeTrench, `{OTHER_TEAM}Count`)
+		homeFull = homeCount >= MapLoader.GetSlotCount(homeTrench)
+	end
 
 	for unitType, button in deployButtons do
 		local definition = GameConfig.Units[unitType]
-		local blockedByTrench = homeFull and definition.OccupiesTrenchSlot
-		if not GameConfig.IsUnitUnlocked(unitType, unlockState) then
+		if not homeTrench then
+			button.Text = `{definition.DisplayName}: no home trench`
+			setEnabled(button, false)
+		elseif not GameConfig.IsUnitUnlocked(unitType, unlockState) then
 			button.Text = `{definition.DisplayName}: {GameConfig.DescribeUnlock(unitType)}`
 			setEnabled(button, false)
-		elseif blockedByTrench then
+		elseif homeFull and definition.OccupiesTrenchSlot then
 			button.Text = `{definition.DisplayName}: Trench {homeTrench} full`
 			setEnabled(button, false)
 		else
@@ -188,45 +190,58 @@ local function refreshDeployRow(supplies: number)
 end
 
 local function refreshTrenchRow()
-	for trenchIndex, button in trenchButtons do
-		local count = getTrenchNumber(trenchIndex, `{TEAM}Count`)
-		local hasOfficer = getTrenchFlag(trenchIndex, `{TEAM}CanCharge`) or getTrenchFlag(trenchIndex, `{TEAM}CanBuild`)
-		button.Text = `Trench {trenchIndex}: {count}{if hasOfficer then " + Officer" else ""}`
-		button.BackgroundColor3 = if trenchIndex == selectedTrench then SELECTED_COLOR else unselectedColor
+	for trenchId, button in trenchButtons do
+		local count = getTrenchNumber(trenchId, `{TEAM}Count`)
+		local hasOfficer = getTrenchFlag(trenchId, `{TEAM}CanCharge`) or getTrenchFlag(trenchId, `{TEAM}CanBuild`)
+		button.Text = `Trench {trenchId}: {count}{if hasOfficer then " + Officer" else ""}`
+		button.BackgroundColor3 = if trenchId == selectedTrench then SELECTED_COLOR else unselectedColor
 	end
 end
 
 local function refreshOrdersRow(supplies: number)
-	local trenchIndex = selectedTrench
-	local count = getTrenchNumber(trenchIndex, `{TEAM}Count`)
-	local ahead = trenchIndex + advanceDirection
-	local behind = trenchIndex - advanceDirection
-	local otherTeamCount = if TEAM == "Allies" then "EnemiesCount" else "AlliesCount"
+	local charge = GameConfig.Charge
+	local trenchId = selectedTrench
+	if not trenchId then
+		retreatButton.Text = "Retreat"
+		advanceButton.Text = "Advance"
+		chargeButton.Text = charge.DisplayName
+		setEnabled(retreatButton, false)
+		setEnabled(advanceButton, false)
+		setEnabled(chargeButton, false)
+		for fortType, button in buildButtons do
+			button.Text = GameConfig.Fortifications[fortType].DisplayName
+			setEnabled(button, false)
+		end
+		return
+	end
 
-	if isValidTrenchIndex(behind) then
-		retreatButton.Text = `Retreat {trenchIndex} > {behind}`
+	local count = getTrenchNumber(trenchId, `{TEAM}Count`)
+	local ahead = MapLoader.GetNeighbor(trenchId, TEAM, false)
+	local behind = MapLoader.GetNeighbor(trenchId, TEAM, true)
+
+	if behind then
+		retreatButton.Text = `Retreat {trenchId} > {behind}`
 		setEnabled(retreatButton, count > 0)
 	else
 		retreatButton.Text = "Retreat: none behind"
 		setEnabled(retreatButton, false)
 	end
 
-	if isValidTrenchIndex(ahead) then
+	if ahead then
 		-- Moving into a trench with enemy units in it is an assault.
-		local verb = if getTrenchNumber(ahead, otherTeamCount) > 0 then "Assault" else "Advance"
-		advanceButton.Text = `{verb} {trenchIndex} > {ahead}`
+		local verb = if getTrenchNumber(ahead, `{OTHER_TEAM}Count`) > 0 then "Assault" else "Advance"
+		advanceButton.Text = `{verb} {trenchId} > {ahead}`
 		setEnabled(advanceButton, count > 0)
 	else
 		advanceButton.Text = "Advance: none ahead"
 		setEnabled(advanceButton, false)
 	end
 
-	local charge = GameConfig.Charge
-	local cooldownLeft = getTrenchNumber(trenchIndex, `{TEAM}ChargeReadyAt`) - Workspace:GetServerTimeNow()
-	if not isValidTrenchIndex(ahead) then
+	local cooldownLeft = getTrenchNumber(trenchId, `{TEAM}ChargeReadyAt`) - Workspace:GetServerTimeNow()
+	if not ahead then
 		chargeButton.Text = `{charge.DisplayName}: none ahead`
 		setEnabled(chargeButton, false)
-	elseif not getTrenchFlag(trenchIndex, `{TEAM}CanCharge`) then
+	elseif not getTrenchFlag(trenchId, `{TEAM}CanCharge`) then
 		chargeButton.Text = `{charge.DisplayName}: needs Officer`
 		setEnabled(chargeButton, false)
 	elseif cooldownLeft > 0 then
@@ -237,12 +252,13 @@ local function refreshOrdersRow(supplies: number)
 		setEnabled(chargeButton, supplies >= charge.Cost)
 	end
 
-	local canBuild = getTrenchFlag(trenchIndex, `{TEAM}CanBuild`)
-	local ownsTrench = trenchModels[trenchIndex]:GetAttribute("Owner") == TEAM
+	local canBuild = getTrenchFlag(trenchId, `{TEAM}CanBuild`)
+	local trench = MapLoader.GetTrenchModel(trenchId)
+	local ownsTrench = trench ~= nil and trench:GetAttribute("Owner") == TEAM
 	for fortType, button in buildButtons do
 		local definition = GameConfig.Fortifications[fortType]
-		local built = getTrenchNumber(trenchIndex, `Fort_{fortType}_Count`)
-		local building = getTrenchNumber(trenchIndex, `Fort_{fortType}_Building`)
+		local built = getTrenchNumber(trenchId, `Fort_{fortType}_Count`)
+		local building = getTrenchNumber(trenchId, `Fort_{fortType}_Building`)
 		if building > 0 then
 			button.Text = `{definition.DisplayName}: {if canBuild then "building" else "paused, needs Officer"}`
 			setEnabled(button, false)
@@ -269,6 +285,41 @@ local function refresh()
 	refreshOrdersRow(supplies)
 end
 
+-- Rebuilds the trench buttons from the current map and re-subscribes to each
+-- trench's replicated state.
+local function rebuildTrenchRow()
+	for _, connection in trenchConnections do
+		connection:Disconnect()
+	end
+	table.clear(trenchConnections)
+	for _, button in trenchButtons do
+		button:Destroy()
+	end
+	table.clear(trenchButtons)
+
+	local trenchIds = MapLoader.GetTrenchIds()
+	local cellSize = getCellSize(#trenchIds)
+	for order, trenchId in trenchIds do
+		local button = makeButton(`Trench_{trenchId}`, order, cellSize, trenchRow)
+		trenchButtons[trenchId] = button
+		button.Activated:Connect(function()
+			selectedTrench = trenchId
+			refresh()
+		end)
+
+		local trench = MapLoader.GetTrenchModel(trenchId)
+		if trench then
+			table.insert(trenchConnections, trench.AttributeChanged:Connect(refresh))
+		end
+	end
+
+	-- Keep the selection on a trench that still exists.
+	if not selectedTrench or not MapLoader.HasTrench(selectedTrench) then
+		selectedTrench = MapLoader.GetHomeTrenchId(TEAM) or trenchIds[1]
+	end
+	refresh()
+end
+
 -- Input ---------------------------------------------------------------------------
 
 local function requestDeploy(unitType: string)
@@ -284,17 +335,10 @@ for unitType, button in deployButtons do
 	end)
 end
 
-for trenchIndex, button in trenchButtons do
-	button.Activated:Connect(function()
-		selectedTrench = trenchIndex
-		refresh()
-	end)
-end
-
 -- Fires `remote` for the selected trench when an enabled order button is used.
 local function connectOrder(button: TextButton, remote: RemoteEvent, extraArgument: string?)
 	button.Activated:Connect(function()
-		if button.Active then
+		if button.Active and selectedTrench then
 			remote:FireServer(selectedTrench, extraArgument)
 		end
 	end)
@@ -315,12 +359,10 @@ ContextActionService:BindAction(DEPLOY_ACTION, function(_actionName: string, inp
 	return Enum.ContextActionResult.Sink
 end, false, Enum.KeyCode.E, Enum.KeyCode.ButtonX)
 
-for _, trench in trenchModels do
-	trench.AttributeChanged:Connect(refresh)
-end
 teamState.AttributeChanged:Connect(refresh)
+MapLoader.Changed:Connect(rebuildTrenchRow)
 
-refresh()
+rebuildTrenchRow()
 screenGui.Parent = playerGui
 
 task.spawn(function()

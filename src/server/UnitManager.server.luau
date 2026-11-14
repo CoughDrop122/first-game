@@ -6,6 +6,10 @@
 -- A team wins by taking the other's home trench; the simulation then freezes
 -- until a player restarts the match.
 --
+-- All map knowledge (which trenches exist, their slots, links, facing and the
+-- spawn points) comes from Shared.MapLoader; nothing here assumes a layout.
+-- A "trenchIndex" is a trench's id, not a position in a row.
+--
 -- Trench Models carry replicated attributes the client UI reads:
 --   AlliesCount / EnemiesCount       : units tied to the trench
 --   Owner                            : last team to hold the trench uncontested
@@ -20,7 +24,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
-local GameConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("GameConfig"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local GameConfig = require(Shared:WaitForChild("GameConfig"))
+local MapLoader = require(Shared:WaitForChild("MapLoader"))
 local Economy = require(script.Parent:WaitForChild("Economy"))
 
 type Team = GameConfig.Team
@@ -55,7 +61,10 @@ type Fortification = {
 	team: Team,
 	trenchIndex: number,
 	model: Model,
-	centerX: number, -- world X of the hazard strip's centre line
+	-- Local frame on the ground at the fortification's centre: X points away
+	-- from the trench toward the builder's enemy, Z runs along the trench.
+	frame: CFrame,
+	halfLength: number, -- half the fortification's extent along the trench
 	buildProgress: number, -- seconds of construction done
 	built: boolean,
 	health: number,
@@ -89,25 +98,25 @@ local UNDER_CONSTRUCTION_TRANSPARENCY = 0.7
 local CHARACTER_BODY_SIZE = Vector3.new(2, 3.8, 1)
 local CHARACTER_HEAD_DIAMETER = 1.2
 
-local TEAM_FACING: { [Team]: Vector3 } = {
-	Allies = Vector3.xAxis,
-	Enemies = -Vector3.xAxis,
-}
+-- Safety limit on how many trenches an order may spill past.
+local MAX_TRENCH_HOPS = 64
 
 local function getOtherTeam(team: Team): Team
 	return if team == "Allies" then "Enemies" else "Allies"
 end
 
 local function isValidTrenchIndex(trenchIndex: number): boolean
-	return trenchIndex >= 1 and trenchIndex <= GameConfig.TRENCH_COUNT
+	return MapLoader.HasTrench(trenchIndex)
 end
 
 -- World setup ---------------------------------------------------------------
 
-local trenchesFolder = Workspace:WaitForChild("Trenches")
-local trenchModels: { Model } = {}
-for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-	trenchModels[trenchIndex] = trenchesFolder:WaitForChild(`Trench_{trenchIndex}`) :: Model
+MapLoader.WaitUntilReady()
+
+-- The trench's Model. Callers pass ids of trenches known to exist (orders are
+-- checked with isValidTrenchIndex first).
+local function getTrenchModel(trenchIndex: number): Model
+	return MapLoader.GetTrenchModel(trenchIndex) :: Model
 end
 
 local unitsFolder = Instance.new("Folder")
@@ -148,10 +157,17 @@ local units: { Unit } = {}
 local nextUnitId = 1
 local rng = Random.new()
 
--- slots[trenchIndex][slotIndex] = the unit assigned there (arrived or en route).
-local slots: { { [number]: Unit } } = {}
-for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-	slots[trenchIndex] = {}
+-- slotsByTrench[trenchIndex][slotIndex] = the unit assigned there (arrived or
+-- en route). Created on demand, so trenches can appear after startup.
+local slotsByTrench: { [number]: { [number]: Unit } } = {}
+
+local function getSlots(trenchIndex: number): { [number]: Unit }
+	local trenchSlots = slotsByTrench[trenchIndex]
+	if not trenchSlots then
+		trenchSlots = {}
+		slotsByTrench[trenchIndex] = trenchSlots
+	end
+	return trenchSlots
 end
 
 local fortifications: { Fortification } = {}
@@ -188,7 +204,7 @@ local function hasSettledAbility(
 	team: Team,
 	ability: "CanOrderCharge" | "CanBuildFortifications"
 ): boolean
-	for _, unit in slots[trenchIndex] do
+	for _, unit in getSlots(trenchIndex) do
 		local abilities = unit.def.Abilities
 		if unit.team == team and unit.arrived and abilities and abilities[ability] then
 			return true
@@ -199,7 +215,7 @@ end
 
 -- Whether any unit of the other team holds, or is heading for, a slot in the trench.
 local function isOccupiedByEnemy(trenchIndex: number, team: Team): boolean
-	for _, unit in slots[trenchIndex] do
+	for _, unit in getSlots(trenchIndex) do
 		if unit.team ~= team then
 			return true
 		end
@@ -210,7 +226,7 @@ end
 -- Strongest aura among `team`'s units settled in the trench, if any.
 local function getAura(trenchIndex: number, team: Team): UnitAura?
 	local best: UnitAura? = nil
-	for _, unit in slots[trenchIndex] do
+	for _, unit in getSlots(trenchIndex) do
 		local abilities = unit.def.Abilities
 		local aura = abilities and abilities.Aura
 		if aura and unit.team == team and unit.arrived then
@@ -224,7 +240,7 @@ end
 
 -- Refreshes the trench's unit-related attributes (see the header comment).
 local function refreshTrench(trenchIndex: number)
-	local trench = trenchModels[trenchIndex]
+	local trench = getTrenchModel(trenchIndex)
 	for _, team in TEAMS do
 		trench:SetAttribute(`{team}Count`, countUnits(trenchIndex, team))
 		trench:SetAttribute(`{team}CanCharge`, hasSettledAbility(trenchIndex, team, "CanOrderCharge"))
@@ -246,7 +262,7 @@ local function countFortifications(trenchIndex: number, fortType: string): (numb
 end
 
 local function refreshFortificationAttributes(trenchIndex: number)
-	local trench = trenchModels[trenchIndex]
+	local trench = getTrenchModel(trenchIndex)
 	for fortType in GameConfig.Fortifications do
 		local total, building = countFortifications(trenchIndex, fortType)
 		trench:SetAttribute(`Fort_{fortType}_Count`, total)
@@ -271,7 +287,7 @@ end
 local function updateOwner(trenchIndex: number)
 	local holder: Team? = nil
 	local settled = false
-	for _, unit in slots[trenchIndex] do
+	for _, unit in getSlots(trenchIndex) do
 		if holder and unit.team ~= holder then
 			return
 		end
@@ -282,7 +298,7 @@ local function updateOwner(trenchIndex: number)
 		return
 	end
 
-	local trench = trenchModels[trenchIndex]
+	local trench = getTrenchModel(trenchIndex)
 	if trench:GetAttribute("Owner") == holder then
 		return
 	end
@@ -294,7 +310,7 @@ local function updateOwner(trenchIndex: number)
 	end
 
 	-- Taking the other team's home trench wins the match.
-	if not matchOver and trenchIndex == GameConfig.GetHomeTrenchIndex(getOtherTeam(holder)) then
+	if not matchOver and MapLoader.GetHomeTeam(trenchIndex) == getOtherTeam(holder) then
 		matchOver = true
 		matchEndedAt = os.clock()
 		Economy.SetWinner(holder)
@@ -303,10 +319,12 @@ end
 
 -- Free slot closest to preferredSlot, or nil if the trench is full.
 local function findFreeSlot(trenchIndex: number, preferredSlot: number): number?
-	local trenchSlots = slots[trenchIndex]
-	for offset = 0, GameConfig.SLOTS_PER_TRENCH - 1 do
-		for _, slotIndex in { preferredSlot - offset, preferredSlot + offset } do
-			if slotIndex >= 1 and slotIndex <= GameConfig.SLOTS_PER_TRENCH and not trenchSlots[slotIndex] then
+	local trenchSlots = getSlots(trenchIndex)
+	local slotCount = MapLoader.GetSlotCount(trenchIndex)
+	local preferred = math.clamp(preferredSlot, 1, math.max(slotCount, 1))
+	for offset = 0, slotCount - 1 do
+		for _, slotIndex in { preferred - offset, preferred + offset } do
+			if slotIndex >= 1 and slotIndex <= slotCount and not trenchSlots[slotIndex] then
 				return slotIndex
 			end
 		end
@@ -315,8 +333,8 @@ local function findFreeSlot(trenchIndex: number, preferredSlot: number): number?
 end
 
 local function vacateSlot(unit: Unit)
-	if slots[unit.trenchIndex][unit.slotIndex] == unit then
-		slots[unit.trenchIndex][unit.slotIndex] = nil
+	if getSlots(unit.trenchIndex)[unit.slotIndex] == unit then
+		getSlots(unit.trenchIndex)[unit.slotIndex] = nil
 	end
 end
 
@@ -324,7 +342,7 @@ local function assignSlot(unit: Unit, trenchIndex: number, slotIndex: number)
 	local previousTrench = unit.trenchIndex
 	vacateSlot(unit)
 
-	slots[trenchIndex][slotIndex] = unit
+	getSlots(trenchIndex)[slotIndex] = unit
 	unit.trenchIndex = trenchIndex
 	unit.slotIndex = slotIndex
 	unit.preferredSlot = slotIndex
@@ -336,20 +354,19 @@ local function assignSlot(unit: Unit, trenchIndex: number, slotIndex: number)
 	refreshTrench(trenchIndex)
 end
 
--- Sends a unit to stand in the open just short of a trench, approaching in
--- `travelDirection` (+1 / -1 along X). Used when the trench has no free slot
+-- Sends a unit to stand in the open just short of a trench. `travelDirection`
+-- is which way it approaches: +1 moving toward the Enemies' side, -1 toward
+-- the Allies' side. Used when the trench has no free slot
 -- (the movement loop moves the unit in as soon as one opens) and for unit
 -- types that never occupy a slot.
 local function queueForTrench(unit: Unit, trenchIndex: number, travelDirection: number)
 	local previousTrench = unit.trenchIndex
 	vacateSlot(unit)
 
-	local lanePosition = GameConfig.GetSlotWorldPosition(trenchIndex, unit.preferredSlot)
-	unit.waitPosition = Vector3.new(
-		lanePosition.X - travelDirection * WAIT_STANDOFF,
-		GameConfig.GROUND_Y,
-		lanePosition.Z
-	)
+	local lanePosition = MapLoader.GetLanePosition(trenchIndex, unit.preferredSlot)
+	local approach = MapLoader.GetEnemyDirection(trenchIndex) * travelDirection
+	local waitPosition = lanePosition - approach * WAIT_STANDOFF
+	unit.waitPosition = Vector3.new(waitPosition.X, MapLoader.GetGroundY(), waitPosition.Z)
 	unit.trenchIndex = trenchIndex
 	unit.slotIndex = NO_SLOT
 	unit.arrived = false
@@ -473,8 +490,11 @@ local function spawnUnit(team: Team, unitType: string): Unit?
 		return nil
 	end
 
-	local homeTrench = GameConfig.GetHomeTrenchIndex(team)
-	local preferredSlot = rng:NextInteger(1, GameConfig.SLOTS_PER_TRENCH)
+	local homeTrench = MapLoader.GetHomeTrenchId(team)
+	if not homeTrench then
+		return nil
+	end
+	local preferredSlot = rng:NextInteger(1, math.max(MapLoader.GetSlotCount(homeTrench), 1))
 	local slotIndex: number? = nil
 	if def.OccupiesTrenchSlot then
 		slotIndex = findFreeSlot(homeTrench, preferredSlot)
@@ -490,15 +510,14 @@ local function spawnUnit(team: Team, unitType: string): Unit?
 	local id = nextUnitId
 	nextUnitId += 1
 
-	-- Start level with the destination lane so the unit marches straight in.
-	local lanePosition = GameConfig.GetSlotWorldPosition(homeTrench, preferredSlot)
 	local unit: Unit = {
 		id = id,
 		unitType = unitType,
 		def = def,
 		team = team,
 		model = buildUnitModel(team, id, unitType, def),
-		position = Vector3.new(GameConfig.GetSpawnZoneCenterX(team), GameConfig.GROUND_Y, lanePosition.Z),
+		-- Level with the destination lane, so the unit marches straight in.
+		position = MapLoader.GetSpawnPosition(team, homeTrench, preferredSlot),
 		trenchIndex = homeTrench,
 		slotIndex = NO_SLOT,
 		preferredSlot = preferredSlot,
@@ -516,9 +535,9 @@ local function spawnUnit(team: Team, unitType: string): Unit?
 	if slotIndex then
 		assignSlot(unit, homeTrench, slotIndex)
 	else
-		queueForTrench(unit, homeTrench, GameConfig.GetAdvanceDirection(team))
+		queueForTrench(unit, homeTrench, MapLoader.GetSideSign(team))
 	end
-	placeUnit(unit, TEAM_FACING[team])
+	placeUnit(unit, MapLoader.GetFacing(homeTrench, team))
 	unit.model.Parent = unitsFolder
 	return unit
 end
@@ -533,10 +552,10 @@ end
 -- Units that never occupy a slot simply move up outside the next trench.
 -- `chargeDuration` > 0 makes it a Charge (see GameConfig.Charge).
 local function orderTrench(team: Team, trenchIndex: number, retreat: boolean, chargeDuration: number)
-	local advanceDirection = GameConfig.GetAdvanceDirection(team)
-	local travelDirection = if retreat then -advanceDirection else advanceDirection
-	local firstTarget = trenchIndex + travelDirection
-	if not isValidTrenchIndex(firstTarget) then
+	local sideSign = MapLoader.GetSideSign(team)
+	local travelDirection = if retreat then -sideSign else sideSign
+	local firstTarget = MapLoader.GetNeighbor(trenchIndex, team, retreat)
+	if not firstTarget then
 		return
 	end
 
@@ -552,9 +571,15 @@ local function orderTrench(team: Team, trenchIndex: number, retreat: boolean, ch
 		local slotIndex: number? = nil
 		if unit.def.OccupiesTrenchSlot then
 			slotIndex = findFreeSlot(destination, unit.preferredSlot)
-			while not slotIndex and isValidTrenchIndex(destination + travelDirection) do
-				destination += travelDirection
+			local hops = 0
+			while not slotIndex and hops < MAX_TRENCH_HOPS do
+				local nextTrench = MapLoader.GetNeighbor(destination, team, retreat)
+				if not nextTrench then
+					break
+				end
+				destination = nextTrench
 				slotIndex = findFreeSlot(destination, unit.preferredSlot)
+				hops += 1
 			end
 		end
 
@@ -578,57 +603,63 @@ local function setModelTransparency(model: Model, transparency: number)
 	end
 end
 
--- Rows of posts strung with wire, covering the hazard strip centred on centerX.
-local function buildBarbedWireModel(model: Model, def: FortificationDefinition, centerX: number)
-	local length = GameConfig.TRENCH_LENGTH
+-- Fortification parts are positioned in the fortification's local frame (see
+-- Fortification.frame), so they follow however the trench is oriented.
+local function makeFortPart(props: { [string]: any }, frame: CFrame, localPosition: Vector3, parent: Instance): Part
+	local part = makePart(props, parent)
+	part.CFrame = frame * CFrame.new(localPosition)
+	return part
+end
+
+-- Rows of posts strung with wire, covering the hazard strip.
+local function buildBarbedWireModel(model: Model, def: FortificationDefinition, frame: CFrame, halfLength: number, _halfWidth: number)
 	local postSpacing = 6
 	local postHeight = 0.6
 	local rowOffsets = { -def.Depth / 2 + 0.5, 0, def.Depth / 2 - 0.5 }
 
 	for _, rowOffset in rowOffsets do
-		local x = centerX + rowOffset
 		for _, wireHeight in { 0.25, 0.5 } do
-			makePart({
+			makeFortPart({
 				Name = "Wire",
-				Size = Vector3.new(0.06, 0.06, length),
-				Position = Vector3.new(x, GameConfig.GROUND_Y + wireHeight, 0),
+				Size = Vector3.new(0.06, 0.06, halfLength * 2),
 				Color = WIRE_COLOR,
 				Material = Enum.Material.Metal,
-			}, model)
+			}, frame, Vector3.new(rowOffset, wireHeight, 0), model)
 		end
-		for z = -length / 2, length / 2, postSpacing do
-			makePart({
+		for z = -halfLength, halfLength, postSpacing do
+			makeFortPart({
 				Name = "Post",
 				Size = Vector3.new(0.15, postHeight, 0.15),
-				Position = Vector3.new(x, GameConfig.GROUND_Y + postHeight / 2, z),
 				Color = WIRE_POST_COLOR,
 				Material = Enum.Material.Wood,
-			}, model)
+			}, frame, Vector3.new(rowOffset, postHeight / 2, z), model)
 		end
 	end
 end
 
--- An extra course of sandbags on top of both trench walls.
-local function buildSandbagsModel(model: Model, _def: FortificationDefinition, centerX: number)
+-- An extra course of sandbags along both edges of the trench, sitting at the
+-- height of the generated trench's sandbag wall (GameConfig.SANDBAG_HEIGHT).
+local function buildSandbagsModel(
+	model: Model,
+	_def: FortificationDefinition,
+	frame: CFrame,
+	halfLength: number,
+	halfWidth: number
+)
 	local courseHeight = 0.35
-	local wallOffsetX = GameConfig.TRENCH_WIDTH / 2 + GameConfig.SANDBAG_THICKNESS / 2
+	local wallOffset = halfWidth + GameConfig.SANDBAG_THICKNESS / 2
 	for _, side in { -1, 1 } do
-		makePart({
+		makeFortPart({
 			Name = "SandbagCourse",
-			Size = Vector3.new(GameConfig.SANDBAG_THICKNESS * 0.8, courseHeight, GameConfig.TRENCH_LENGTH),
-			Position = Vector3.new(
-				centerX + side * wallOffsetX,
-				GameConfig.GROUND_Y + GameConfig.SANDBAG_HEIGHT + courseHeight / 2,
-				0
-			),
+			Size = Vector3.new(GameConfig.SANDBAG_THICKNESS * 0.8, courseHeight, halfLength * 2),
 			Color = REINFORCED_SANDBAG_COLOR,
 			Material = Enum.Material.Sand,
-		}, model)
+		}, frame, Vector3.new(side * wallOffset, GameConfig.SANDBAG_HEIGHT + courseHeight / 2, 0), model)
 	end
 end
 
 -- Procedural model builders, keyed by FortificationDefinition.Model.
-local FORTIFICATION_MODEL_BUILDERS: { [string]: (Model, FortificationDefinition, number) -> () } = {
+local FORTIFICATION_MODEL_BUILDERS: { [string]: (Model, FortificationDefinition, CFrame, number, number) -> () } = {
 	BarbedWire = buildBarbedWireModel,
 	Sandbags = buildSandbagsModel,
 }
@@ -641,7 +672,7 @@ local function startFortification(team: Team, trenchIndex: number, fortType: str
 	if not def then
 		return false
 	end
-	if trenchModels[trenchIndex]:GetAttribute("Owner") ~= team then
+	if getTrenchModel(trenchIndex):GetAttribute("Owner") ~= team then
 		return false
 	end
 	if not hasSettledAbility(trenchIndex, team, "CanBuildFortifications") then
@@ -656,9 +687,12 @@ local function startFortification(team: Team, trenchIndex: number, fortType: str
 	end
 
 	-- Hazard strips go in front of the trench, each further one beyond the last.
-	local forward = GameConfig.GetAdvanceDirection(team)
-	local centerX = GameConfig.GetTrenchCenterX(trenchIndex)
+	local forward = MapLoader.GetFacing(trenchIndex, team)
+	local center = MapLoader.GetTrenchCenter(trenchIndex)
+	local origin = Vector3.new(center.X, MapLoader.GetGroundY(), center.Z)
 		+ forward * (def.ForwardOffset + existing * (def.Depth + 1))
+	local frame = CFrame.fromMatrix(origin, forward, Vector3.yAxis, forward:Cross(Vector3.yAxis))
+	local halfLength = MapLoader.GetTrenchHalfLength(trenchIndex)
 
 	local model = Instance.new("Model")
 	model.Name = `{fortType}_Trench{trenchIndex}`
@@ -666,7 +700,7 @@ local function startFortification(team: Team, trenchIndex: number, fortType: str
 	model:SetAttribute("TrenchIndex", trenchIndex)
 	local buildModel = FORTIFICATION_MODEL_BUILDERS[def.Model]
 	if buildModel then
-		buildModel(model, def, centerX)
+		buildModel(model, def, frame, halfLength, MapLoader.GetTrenchHalfWidth(trenchIndex))
 	end
 	setModelTransparency(model, UNDER_CONSTRUCTION_TRANSPARENCY)
 	model.Parent = fortificationsFolder
@@ -677,7 +711,8 @@ local function startFortification(team: Team, trenchIndex: number, fortType: str
 		team = team,
 		trenchIndex = trenchIndex,
 		model = model,
-		centerX = centerX,
+		frame = frame,
+		halfLength = halfLength,
 		buildProgress = 0,
 		built = false,
 		health = def.MaxHP,
@@ -945,6 +980,12 @@ end
 
 -- Movement --------------------------------------------------------------------
 
+-- Whether a position lies inside a fortification's hazard strip.
+local function isInsideStrip(fort: Fortification, position: Vector3): boolean
+	local localPosition = fort.frame:PointToObjectSpace(position)
+	return math.abs(localPosition.X) <= fort.def.Depth / 2 and math.abs(localPosition.Z) <= fort.halfLength
+end
+
 -- Applies enemy hazard strips (barbed wire) the unit is standing in: the unit
 -- is hurt and cuts at the wire. Returns its move-speed multiplier.
 local function applyHazards(unit: Unit, deltaTime: number): number
@@ -956,8 +997,7 @@ local function applyHazards(unit: Unit, deltaTime: number): number
 			and fort.built
 			and not fort.destroyed
 			and fort.team ~= unit.team
-			and math.abs(unit.position.X - fort.centerX) <= def.Depth / 2
-			and math.abs(unit.position.Z) <= GameConfig.TRENCH_LENGTH / 2
+			and isInsideStrip(fort, unit.position)
 		then
 			speedMultiplier = math.min(speedMultiplier, def.SlowMultiplier)
 			if def.MaxHP > 0 then
@@ -1009,7 +1049,7 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 		-- trench while the enemy still occupies it.
 		local holding = unit.target ~= nil and not unit.retreating
 		if holding and charging then
-			local distanceToTrench = math.abs(unit.position.X - GameConfig.GetTrenchCenterX(unit.trenchIndex))
+			local distanceToTrench = MapLoader.GetDistanceAlongAxis(unit.trenchIndex, unit.position)
 			holding = distanceToTrench <= GameConfig.Charge.HaltDistance
 				and isOccupiedByEnemy(unit.trenchIndex, unit.team)
 		end
@@ -1022,7 +1062,7 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 
 		local hasSlot = unit.slotIndex ~= NO_SLOT
 		local destination = if hasSlot
-			then GameConfig.GetSlotWorldPosition(unit.trenchIndex, unit.slotIndex)
+			then MapLoader.GetSlotPosition(unit.trenchIndex, unit.slotIndex)
 			else unit.waitPosition
 		local toDestination = Vector3.new(destination.X - unit.position.X, 0, destination.Z - unit.position.Z)
 		local distance = toDestination.Magnitude
@@ -1032,7 +1072,7 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 			-- March across open ground.
 			local direction = toDestination / distance
 			local moved = unit.position + direction * step
-			unit.position = Vector3.new(moved.X, GameConfig.GROUND_Y, moved.Z)
+			unit.position = Vector3.new(moved.X, MapLoader.GetGroundY(), moved.Z)
 			placeUnit(unit, direction)
 		elseif hasSlot then
 			-- Drop into the slot and face the enemy.
@@ -1040,14 +1080,14 @@ RunService.Heartbeat:Connect(function(deltaTime: number)
 			unit.arrived = true
 			unit.retreating = false
 			unit.chargeTimeLeft = 0
-			placeUnit(unit, TEAM_FACING[unit.team])
+			placeUnit(unit, MapLoader.GetFacing(unit.trenchIndex, unit.team))
 			refreshTrench(unit.trenchIndex)
 			updateOwner(unit.trenchIndex)
 		elseif distance > 0.01 or unit.retreating then
 			-- Reached the waiting spot outside the trench; stand facing the enemy.
 			unit.position = destination
 			unit.retreating = false
-			placeUnit(unit, TEAM_FACING[unit.team])
+			placeUnit(unit, MapLoader.GetFacing(unit.trenchIndex, unit.team))
 		end
 	end
 end)
@@ -1062,7 +1102,7 @@ local chargeReadyAt: { [Team]: { [number]: number } } = { Allies = {}, Enemies =
 -- order it, the cooldown has passed and the team can afford it.
 local function triggerCharge(team: Team, trenchIndex: number): boolean
 	local charge = GameConfig.Charge
-	if not isValidTrenchIndex(trenchIndex + GameConfig.GetAdvanceDirection(team)) then
+	if not MapLoader.GetNeighbor(trenchIndex, team, false) then
 		return false
 	end
 	if not hasSettledAbility(trenchIndex, team, "CanOrderCharge") then
@@ -1078,7 +1118,7 @@ local function triggerCharge(team: Team, trenchIndex: number): boolean
 
 	local readyAt = now + charge.Cooldown
 	chargeReadyAt[team][trenchIndex] = readyAt
-	trenchModels[trenchIndex]:SetAttribute(`{team}ChargeReadyAt`, readyAt)
+	getTrenchModel(trenchIndex):SetAttribute(`{team}ChargeReadyAt`, readyAt)
 	orderTrench(team, trenchIndex, false, charge.Duration)
 	return true
 end
@@ -1165,9 +1205,7 @@ local function resetMatch()
 		unit.model:Destroy()
 	end
 	units = {}
-	for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-		table.clear(slots[trenchIndex])
-	end
+	table.clear(slotsByTrench)
 
 	for _, fort in fortifications do
 		fort.destroyed = true
@@ -1178,9 +1216,9 @@ local function resetMatch()
 	table.clear(pendingShots)
 	bucketsStale = true
 
-	for trenchIndex = 1, GameConfig.TRENCH_COUNT do
-		local trench = trenchModels[trenchIndex]
-		trench:SetAttribute("Owner", GameConfig.GetInitialOwner(trenchIndex))
+	for _, trenchIndex in MapLoader.GetTrenchIds() do
+		local trench = getTrenchModel(trenchIndex)
+		trench:SetAttribute("Owner", MapLoader.GetInitialOwner(trenchIndex))
 		for _, team in TEAMS do
 			chargeReadyAt[team][trenchIndex] = nil
 			trench:SetAttribute(`{team}ChargeReadyAt`, 0)
@@ -1202,7 +1240,7 @@ end)
 
 -- NPC Enemy commander testing stage -------------------------------------------------------------
 
-for trenchIndex = 1, GameConfig.TRENCH_COUNT do
+for _, trenchIndex in MapLoader.GetTrenchIds() do
 	refreshTrench(trenchIndex)
 	refreshFortificationAttributes(trenchIndex)
 end
@@ -1224,9 +1262,13 @@ task.spawn(function()
 		sinceAdvance += GameConfig.ENEMY_SPAWN_INTERVAL
 		if sinceAdvance >= GameConfig.ENEMY_ADVANCE_INTERVAL then
 			sinceAdvance = 0
-			-- Trench 1 is the Allied side, so low indices are the enemy's front.
-			for trenchIndex = 2, GameConfig.TRENCH_COUNT do
-				if countUnits(trenchIndex, "Enemies") >= GameConfig.ENEMY_ADVANCE_MIN_UNITS then
+			-- Trenches are listed from the Allied side, so the first one that can
+			-- still advance and is well manned is the enemy's front.
+			for _, trenchIndex in MapLoader.GetTrenchIds() do
+				if
+					MapLoader.GetNeighbor(trenchIndex, "Enemies", false)
+					and countUnits(trenchIndex, "Enemies") >= GameConfig.ENEMY_ADVANCE_MIN_UNITS
+				then
 					orderTrench("Enemies", trenchIndex, false, 0)
 					break
 				end

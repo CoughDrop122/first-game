@@ -9,7 +9,8 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
-local GameConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("GameConfig"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local MapLoader = require(Shared:WaitForChild("MapLoader"))
 
 local TOGGLE_ACTION = "ToggleTacticalCamera"
 local PAN_ACTION = "TacticalCameraPan"
@@ -19,7 +20,6 @@ local TILT_DEGREES = 55 -- downward pitch of the tactical camera
 local CAMERA_DISTANCE = 160 -- studs from the camera to its ground focus point
 local PAN_SPEED = 90 -- studs per second for key / d-pad / thumbstick panning
 local THUMBSTICK_DEADZONE = 0.2
-local PAN_LIMIT_X = GameConfig.MAP_SIZE_X / 2
 
 local LABEL_STANDARD = "View: 3rd Person"
 local LABEL_TACTICAL = "View: Tactical"
@@ -76,7 +76,8 @@ end)
 
 local function getTacticalCFrame(): CFrame
 	local tilt = math.rad(TILT_DEGREES)
-	local focus = Vector3.new(panX, GameConfig.GROUND_Y, 0)
+	local boundsMin, boundsMax = MapLoader.GetBounds()
+	local focus = Vector3.new(panX, MapLoader.GetGroundY(), (boundsMin.Z + boundsMax.Z) / 2)
 	-- Sit on the +Z side looking toward -Z so world +X is screen-right:
 	-- Allies on the left, Enemies on the right.
 	local offset = Vector3.new(0, math.sin(tilt), math.cos(tilt)) * CAMERA_DISTANCE
@@ -84,7 +85,8 @@ local function getTacticalCFrame(): CFrame
 end
 
 local function setPanX(x: number)
-	panX = math.clamp(x, -PAN_LIMIT_X, PAN_LIMIT_X)
+	local boundsMin, boundsMax = MapLoader.GetBounds()
+	panX = math.clamp(x, boundsMin.X, boundsMax.X)
 end
 
 local function updateTacticalCamera(deltaTime: number)

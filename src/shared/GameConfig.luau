@@ -1,70 +1,39 @@
 --!strict
--- Shared battlefield constants and layout helpers.
+-- Shared game constants: units, economy, fortifications, remotes, and the
+-- shape of the default generated battlefield.
 --
--- Layout: trenches are parallel strips running along the Z-axis and are spread
--- out along the X-axis. Allies are on the far left (-X), Enemies on the far
--- right (+X). The battlefield is centred on the world origin.
+-- Nothing here says where trenches are. Positions, slot counts and which
+-- trench comes next are read from the map in the Workspace by Shared.MapLoader.
 
 local GameConfig = {}
 
 export type Owner = "Neutral" | "Allies" | "Enemies"
 
--- Trench grid
-GameConfig.TRENCH_COUNT = 5
-GameConfig.TRENCH_SPACING = 54 -- studs between trench centres (X-axis)
-GameConfig.TRENCH_LENGTH = 48 -- studs (Z-axis)
-GameConfig.SLOTS_PER_TRENCH = 10
-
--- Trench shape. Trenches and (later) units are miniatures: players stay
--- normal-sized and tower over the battlefield like a tabletop diorama.
+-- Trenches and units are miniatures: players stay normal-sized and tower over
+-- the battlefield like a tabletop diorama.
 GameConfig.MINIATURE_SCALE = 1 / 3 -- size of units relative to a player character
-GameConfig.TRENCH_WIDTH = 2 -- studs (X-axis)
-GameConfig.TRENCH_DEPTH = 1 -- how far the floor sits below ground level
+
+-- Height of the open ground, for a map that sets no GroundY attribute.
+GameConfig.GROUND_Y = 0
+-- Sandbag wall of a generated trench; reinforced sandbags are sized to match.
 GameConfig.SANDBAG_HEIGHT = 0.5
 GameConfig.SANDBAG_THICKNESS = 0.6
+-- Studs of trench per soldier, used when a trench has no valid SlotCount.
+GameConfig.DEFAULT_SLOT_SPACING = 4.8
 
--- Battlefield
-GameConfig.GROUND_Y = 0 -- Y of the walkable ground surface
-GameConfig.SPAWN_ZONE_WIDTH = 24 -- X-depth of each team's spawn zone
-GameConfig.MAP_MARGIN_Z = 12 -- ground beyond each trench end
-
-GameConfig.TRENCH_FLOOR_Y = GameConfig.GROUND_Y - GameConfig.TRENCH_DEPTH
-
--- Outer trenches sit one TRENCH_SPACING away from their spawn zone.
-GameConfig.MAP_SIZE_X = (GameConfig.TRENCH_COUNT + 1) * GameConfig.TRENCH_SPACING
-	+ 2 * GameConfig.SPAWN_ZONE_WIDTH
-GameConfig.MAP_SIZE_Z = GameConfig.TRENCH_LENGTH + 2 * GameConfig.MAP_MARGIN_Z
-
--- World X of a trench's centre line. Trench 1 is nearest the Allies (-X).
-function GameConfig.GetTrenchCenterX(trenchIndex: number): number
-	assert(
-		trenchIndex >= 1 and trenchIndex <= GameConfig.TRENCH_COUNT and trenchIndex % 1 == 0,
-		`trenchIndex must be an integer in 1..{GameConfig.TRENCH_COUNT}, got {trenchIndex}`
-	)
-	return (trenchIndex - (GameConfig.TRENCH_COUNT + 1) / 2) * GameConfig.TRENCH_SPACING
-end
-
--- World position of a troop slot, on the trench floor surface. Slots are evenly
--- distributed along the trench's length (Z-axis); slot 1 is at the -Z end.
-function GameConfig.GetSlotWorldPosition(trenchIndex: number, slotIndex: number): Vector3
-	assert(
-		slotIndex >= 1 and slotIndex <= GameConfig.SLOTS_PER_TRENCH and slotIndex % 1 == 0,
-		`slotIndex must be an integer in 1..{GameConfig.SLOTS_PER_TRENCH}, got {slotIndex}`
-	)
-	local slotLength = GameConfig.TRENCH_LENGTH / GameConfig.SLOTS_PER_TRENCH
-	local z = -GameConfig.TRENCH_LENGTH / 2 + (slotIndex - 0.5) * slotLength
-	return Vector3.new(GameConfig.GetTrenchCenterX(trenchIndex), GameConfig.TRENCH_FLOOR_Y, z)
-end
-
--- Starting ownership: each side holds the trench nearest its spawn zone.
-function GameConfig.GetInitialOwner(trenchIndex: number): Owner
-	if trenchIndex == 1 then
-		return "Allies"
-	elseif trenchIndex == GameConfig.TRENCH_COUNT then
-		return "Enemies"
-	end
-	return "Neutral"
-end
+-- The battlefield MapBuilder generates when the place has no
+-- Workspace.CurrentMap: parallel trenches spread along X, Allies at -X.
+-- Read only by MapBuilder; a map built in Studio ignores all of it.
+GameConfig.DefaultMap = {
+	TrenchCount = 5,
+	TrenchSpacing = 54, -- studs between trench centres
+	TrenchLength = 48, -- studs
+	TrenchWidth = 2, -- studs
+	TrenchDepth = 1, -- how far the floor sits below ground level
+	SlotsPerTrench = 10,
+	SpawnZoneWidth = 24, -- depth of each team's spawn zone
+	MarginZ = 12, -- ground beyond each trench end
+}
 
 -- Teams & economy ---------------------------------------------------------
 
@@ -102,7 +71,7 @@ GameConfig.RESTART_COOLDOWN = 3 -- seconds after a match ends before Play Again 
 -- Hit-chance multiplier against a target settled in a trench, unless the
 -- shooter is in that same trench or its unit type has IgnoresCover.
 GameConfig.TRENCH_COVER_MULTIPLIER = 0.35
--- Width (studs, along X) of the buckets the server sorts units into so a unit
+-- Width (studs, along world X) of the buckets the server sorts units into so a unit
 -- looking for a target only checks enemies near it.
 GameConfig.TARGET_BUCKET_SIZE = 20
 
@@ -170,7 +139,7 @@ local Units: { [string]: UnitDefinition } = {
 		Cost = 50,
 		MaxHP = 100,
 		MoveSpeed = 8,
-		Range = 40, -- less than TRENCH_SPACING, so neighbouring trenches can't trade fire
+		Range = 40, -- less than the default map's trench spacing, so neighbouring trenches can't trade fire
 		FireRate = 0.83,
 		Damage = 25,
 		Accuracy = 0.6,
@@ -244,7 +213,7 @@ local Units: { [string]: UnitDefinition } = {
 		Unlock = { Type = "TrenchesOwned", Count = 2 },
 	},
 
-	-- Slow, precise shots that ignore trench cover. Range exceeds TRENCH_SPACING,
+	-- Slow, precise shots that ignore trench cover. Range exceeds the default map's trench spacing,
 	-- so a sniper can pick at the neighbouring trench without leaving its own.
 	Sniper = {
 		DisplayName = "Sniper",
@@ -384,7 +353,7 @@ export type FortificationDefinition = {
 	CoverMultiplier: number, -- extra multiplier on enemy hit chance against the trench's occupants (1 = none)
 	-- Hazard strip, laid in front of the trench toward the enemy. Depth 0 = no strip.
 	ForwardOffset: number, -- studs from the trench centre to the strip's centre
-	Depth: number, -- studs (X-axis) the strip covers
+	Depth: number, -- studs the strip covers, front to back
 	SlowMultiplier: number, -- move-speed multiplier for enemies inside the strip
 	DamagePerSecond: number, -- to each enemy inside the strip
 	CutDamagePerSecond: number, -- damage each enemy inside deals to the strip (cutting through)
@@ -460,22 +429,6 @@ function GameConfig.GetSortedKeys(registry: { [string]: { SortOrder: number } })
 		return a < b
 	end)
 	return keys
-end
-
--- The trench nearest a team's spawn zone, where its units deploy to.
-function GameConfig.GetHomeTrenchIndex(team: Team): number
-	return if team == "Allies" then 1 else GameConfig.TRENCH_COUNT
-end
-
--- Trench-index step a team takes when advancing toward the other side.
-function GameConfig.GetAdvanceDirection(team: Team): number
-	return if team == "Allies" then 1 else -1
-end
-
--- World X of the centre of a team's spawn zone.
-function GameConfig.GetSpawnZoneCenterX(owner: "Allies" | "Enemies"): number
-	local x = (GameConfig.MAP_SIZE_X - GameConfig.SPAWN_ZONE_WIDTH) / 2
-	return if owner == "Allies" then -x else x
 end
 
 return GameConfig

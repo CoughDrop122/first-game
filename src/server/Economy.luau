@@ -12,9 +12,10 @@
 --   MatchPhase / Winner : match flow (see GameConfig.MATCH_PHASE_*)
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Workspace = game:GetService("Workspace")
 
-local GameConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("GameConfig"))
+local Shared = ReplicatedStorage:WaitForChild("Shared")
+local GameConfig = require(Shared:WaitForChild("GameConfig"))
+local MapLoader = require(Shared:WaitForChild("MapLoader"))
 
 type Team = GameConfig.Team
 type TeamState = GameConfig.TeamState
@@ -35,12 +36,11 @@ teamState.Name = GameConfig.TEAM_STATE_FOLDER
 -- Winner of the current match, or nil while it is still being played.
 local winner: Team? = nil
 
-local trenchesFolder = Workspace:WaitForChild("Trenches")
-
 function Economy.GetTrenchesOwned(team: Team): number
 	local ownedTrenches = 0
-	for _, trench in trenchesFolder:GetChildren() do
-		if trench:GetAttribute("Owner") == team then
+	for _, trenchId in MapLoader.GetTrenchIds() do
+		local trench = MapLoader.GetTrenchModel(trenchId)
+		if trench and trench:GetAttribute("Owner") == team then
 			ownedTrenches += 1
 		end
 	end

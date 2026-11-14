@@ -1,0 +1,18 @@
+newmtl Sandbag11Mtl
+Material Color
+Ka 0.560499 0.43134 0.21952
+Kd 0.560499 0.43134 0.21952
+Ks 0.0219804 0.0169153 0.00860862 
+
+d 1
+
+Ns 0
+
+map_Ka Sandbag11_diff.png
+map_Kd Sandbag11_diff.png
+map_d Sandbag11_diff.png
+
+map_Bump Sandbag11_nmap.png
+
+map_Ns Sandbag11_spec.png
+
